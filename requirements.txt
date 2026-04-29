@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 python-pptx==1.0.2
 requests==2.32.3
 Pillow==10.4.0
+pypdf==4.3.1
