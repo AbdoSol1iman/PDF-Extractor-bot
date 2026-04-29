@@ -4,39 +4,33 @@ import base64
 import time
 import io
 from collections import defaultdict
-import requests
+from openai import OpenAI  # المكتبة الجديدة
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from pptx import Presentation
 from PIL import Image
 from pypdf import PdfReader
 
+# الإعدادات من البيئة
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
+# إعدادات الحدود
 MAX_PER_USER_PER_DAY = 15
 MAX_PER_MINUTE_GLOBAL = 18
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# الموديلات النصية
-TEXT_MODELS = [
-    "google/gemini-2.0-flash-lite-preview-02-05:free",
-    "google/gemini-2.0-pro-exp-02-05:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-]
-
-# موديلات الرؤية (Vision) للـ PPTX
-VISION_MODELS = [
-    "google/gemini-2.0-flash-lite-preview-02-05:free",
-    "google/gemini-2.0-pro-exp-02-05:free",
-]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# إدارة الاستهلاك
 user_usage = defaultdict(lambda: {"count": 0, "reset_time": time.time() + 86400})
 global_minute_usage = {"count": 0, "reset_time": time.time() + 60}
 
+# تهيئة عميل GitHub Models
+client = OpenAI(
+    base_url="https://models.inference.ai.azure.com",
+    api_key=GITHUB_TOKEN,
+)
 
 def check_global_rate() -> bool:
     now = time.time()
@@ -47,7 +41,6 @@ def check_global_rate() -> bool:
         return False
     global_minute_usage["count"] += 1
     return True
-
 
 def check_user_rate(user_id: int):
     now = time.time()
@@ -61,7 +54,6 @@ def check_user_rate(user_id: int):
     user["count"] += 1
     return True, remaining - 1
 
-
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text_parts = []
@@ -70,7 +62,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         if text and text.strip():
             text_parts.append(f"=== Page {i} ===\n{text.strip()}")
     return "\n\n".join(text_parts)
-
 
 def extract_pptx_content(pptx_bytes: bytes):
     prs = Presentation(io.BytesIO(pptx_bytes))
@@ -82,9 +73,8 @@ def extract_pptx_content(pptx_bytes: bytes):
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
                     line = "".join(run.text for run in para.runs).strip()
-                    if line:
-                        slide_texts.append(line)
-            if shape.shape_type == 13:
+                    if line: slide_texts.append(line)
+            if shape.shape_type == 13: # Image
                 try:
                     img = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
                     if max(img.size) > 800:
@@ -94,38 +84,11 @@ def extract_pptx_content(pptx_bytes: bytes):
                     img.save(buf, format="PNG")
                     images_b64.append((slide_num, base64.b64encode(buf.getvalue()).decode("utf-8")))
                 except Exception as e:
-                    logger.warning(f"فشل استخراج صورة slide {slide_num}: {e}")
+                    logger.warning(f"فشل صورة شريحة {slide_num}: {e}")
         if slide_texts:
             text_parts.append(f"=== Slide {slide_num} ===\n" + "\n".join(slide_texts))
     return "\n\n".join(text_parts), images_b64
 
-def call_openrouter_with_fallback(models: list, payload_fn) -> str:
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://railway.app", # متطلب أحياناً في OpenRouter
-    }
-    last_error = "No response from any model"
-    
-    for model in models:
-        payload = payload_fn(model)
-        try:
-            logger.info(f"Trying model: {model}")
-            response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-            
-            if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"]
-            else:
-                last_error = f"Model {model} returned {response.status_code}: {response.text}"
-                logger.warning(last_error)
-                continue # جرب الموديل اللي بعده
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"Error with {model}: {e}")
-            continue
-            
-    raise Exception(f"جميع المحاولات فشلت. السبب الأخير: {last_error}")
-    
 CODE_PROMPT = (
     "Extract all programming code from the following content.\n"
     "For each code block:\n"
@@ -135,42 +98,28 @@ CODE_PROMPT = (
     "If there is no code, say: No programming code found."
 )
 
-
-def ask_with_text(text: str) -> str:
-    def make_payload(model):
-        return {
-            "model": model,
-            "messages": [{"role": "user", "content": f"{CODE_PROMPT}\n\n{text}"}]
-        }
-    return call_openrouter_with_fallback(TEXT_MODELS, make_payload)
-
-
-def ask_with_text_and_images(text: str, images_b64: list) -> str:
-    def make_payload(model):
-        content = []
-        full_prompt = CODE_PROMPT
-        if text.strip():
-            full_prompt += f"\n\n=== Extracted Text ===\n{text}"
-        content.append({"type": "text", "text": full_prompt})
-        for slide_num, img_b64 in images_b64[:10]:
-            content.append({"type": "text", "text": f"--- Image from Slide {slide_num} ---"})
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-            })
-        return {"model": model, "messages": [{"role": "user", "content": content}]}
-    return call_openrouter_with_fallback(VISION_MODELS, make_payload)
-
+def call_github_models(prompt_content):
+    """الاتصال بـ GitHub Copilot Models"""
+    try:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a professional code extractor."},
+                {"role": "user", "content": prompt_content}
+            ],
+            model="gpt-4o-mini",
+            temperature=0.1
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"GitHub API Error: {e}")
+        raise Exception(f"فشل الاتصال بـ GitHub Models: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 أهلاً!\n\n"
-        "📄 ابعتلي PDF أو PPTX وأنا هستخرجلك كل الكود اللي فيه.\n"
-        "🖼️ بيدعم الكود اللي في الصور جوا الـ PPTX كمان!\n\n"
-        f"⚠️ الحد المسموح: {MAX_PER_USER_PER_DAY} ملفات لكل شخص في اليوم.\n\n"
-        "يدعم: Python, Java, C++, JavaScript, وأي لغة تانية."
+        "👋 أهلاً بك في بوت مستخرج الكود (نسخة Copilot)!\n\n"
+        "📄 ابعتلي PDF أو PPTX وهستخرجلك الكود بجودة عالية.\n"
+        f"⚠️ الحد اليومي: {MAX_PER_USER_PER_DAY} ملفات."
     )
-
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -182,92 +131,60 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_pptx = file_name.endswith(".pptx") or "presentationml" in (doc.mime_type or "")
 
     if not is_pdf and not is_pptx:
-        await message.reply_text("⚠️ بس بدعم PDF و PPTX!")
+        await message.reply_text("⚠️ نعتذر، ارسل ملفات PDF أو PPTX فقط.")
         return
 
     allowed, remaining = check_user_rate(user_id)
     if not allowed:
-        await message.reply_text("❌ وصلت للحد اليومي بتاعك!\n⏳ هيتجدد الحد بكره.")
+        await message.reply_text("❌ وصلت للحد اليومي!")
         return
 
     if not check_global_rate():
-        await message.reply_text("⏳ البوت مشغول دلوقتي، جرب تاني بعد دقيقة!")
-        user_usage[user_id]["count"] -= 1
+        await message.reply_text("⏳ ضغط مؤقت، جرب كمان دقيقة.")
         return
 
-    file_type = "PDF" if is_pdf else "PPTX"
-    await message.reply_text(
-        f"⏳ جاري استخراج الكود من الـ {file_type}... انتظر لحظة.\n"
-        f"📊 باقيلك {remaining} ملفات النهارده."
-    )
+    await message.reply_text(f"⏳ جاري معالجة {file_name} عبر GPT-4o-mini...")
 
     try:
         file = await context.bot.get_file(doc.file_id)
         file_bytes = bytes(await file.download_as_bytearray())
 
         if is_pdf:
-            text = extract_text_from_pdf(file_bytes)
-            if not text.strip():
-                await message.reply_text("⚠️ الـ PDF مش فيه نص قابل للاستخراج.")
-                user_usage[user_id]["count"] -= 1
+            extracted_text = extract_text_from_pdf(file_bytes)
+            if not extracted_text.strip():
+                await message.reply_text("⚠️ لم يتم العثور على نص في الـ PDF.")
                 return
-            result_text = ask_with_text(text)
+            final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
         else:
-            text, images_b64 = extract_pptx_content(file_bytes)
-            if not text.strip() and not images_b64:
-                await message.reply_text("⚠️ الملف فاضي!")
-                user_usage[user_id]["count"] -= 1
-                return
-            if images_b64:
-                await message.reply_text(f"🖼️ لقيت {len(images_b64)} صورة، بحلل أول 10...")
-            result_text = ask_with_text_and_images(text, images_b64)
+            extracted_text, images = extract_pptx_content(file_bytes)
+            # GitHub Models تدعم الصور في الـ vision ولكن للتبسيط سنرسل النص 
+            # وإذا أردت دعم الصور (Vision) يتم تعديل الـ prompt_content ليكون List
+            final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
 
+        result_text = call_github_models(final_prompt)
+
+        # تقسيم الرسالة إذا كانت طويلة (تليجرام حدوده 4096 حرف)
         if len(result_text) <= 4000:
             await message.reply_text(result_text, parse_mode="Markdown")
         else:
-            chunks = split_text(result_text, 4000)
-            for i, chunk in enumerate(chunks):
-                header = f"📦 *الجزء {i+1}/{len(chunks)}*\n\n" if len(chunks) > 1 else ""
-                await message.reply_text(header + chunk, parse_mode="Markdown")
+            for i in range(0, len(result_text), 4000):
+                await message.reply_text(result_text[i:i+4000])
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await message.reply_text(f"❌ حصل خطأ: {str(e)}")
-        user_usage[user_id]["count"] -= 1
-
-
-def split_text(text: str, max_length: int) -> list:
-    chunks = []
-    while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
-        if split_at == -1:
-            split_at = max_length
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    if text:
-        chunks.append(text)
-    return chunks
-
-
-async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📄 ابعتلي ملف PDF أو PPTX وأنا هستخرجلك الكود!")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"حدث خطأ غير متوقع: {context.error}")
-    # اختياري: ابعت رسالة للمستخدم تقوله إن فيه ضغط
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text("عذراً، السيرفر عليه ضغط حالياً. جرب كمان شوية!")
-
+        await message.reply_text(f"❌ خطأ فني: {str(e)}")
 
 def main():
+    if not TELEGRAM_TOKEN or not GITHUB_TOKEN:
+        print("❌ تأكد من ضبط TELEGRAM_TOKEN و GITHUB_TOKEN في الإعدادات!")
+        return
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_error_handler(error_handler) # ضيف السطر ده هنا
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
-    print("✅ البوت شغال...")
+    
+    print("✅ البوت شغال الآن باستخدام GitHub Models...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
