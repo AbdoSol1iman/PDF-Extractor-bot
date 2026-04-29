@@ -4,24 +4,24 @@ import base64
 import time
 import io
 from collections import defaultdict
-import google.generativeai as genai
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from pptx import Presentation
 
 # ===== التوكنات من Environment Variables =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # ===== حدود الاستخدام =====
-MAX_PER_USER_PER_DAY = 10
-MAX_PER_MINUTE_GLOBAL = 12
+MAX_PER_USER_PER_DAY = 15
+MAX_PER_MINUTE_GLOBAL = 18  # الحد الفعلي 20، خلينا هامش أمان
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
 
 # ===== تتبع الاستخدام =====
 user_usage = defaultdict(lambda: {"count": 0, "reset_time": time.time() + 86400})
@@ -53,7 +53,6 @@ def check_user_rate(user_id: int):
 
 
 def extract_text_from_pptx(pptx_bytes: bytes) -> str:
-    """بيستخرج كل النصوص من ملف PPTX"""
     prs = Presentation(io.BytesIO(pptx_bytes))
     text_parts = []
     for slide_num, slide in enumerate(prs.slides, start=1):
@@ -67,6 +66,75 @@ def extract_text_from_pptx(pptx_bytes: bytes) -> str:
         if slide_texts:
             text_parts.append(f"=== Slide {slide_num} ===\n" + "\n".join(slide_texts))
     return "\n\n".join(text_parts)
+
+
+def ask_openrouter_with_pdf(pdf_base64: str) -> str:
+    """بيبعت الـ PDF لـ OpenRouter باستخدام cloudflare-ai engine المجاني"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "plugins": [{"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "document.pdf",
+                            "content_type": "application/pdf",
+                            "data": pdf_base64,
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract all programming code from this file.\n"
+                            "For each code block:\n"
+                            "1. Write the language name\n"
+                            "2. Write the complete code inside a code block\n"
+                            "3. Write a very short description\n\n"
+                            "If there is no code, say: No programming code found in this file."
+                        )
+                    }
+                ]
+            }
+        ]
+    }
+    response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def ask_openrouter_with_text(text: str) -> str:
+    """بيبعت النص لـ OpenRouter (للـ PPTX)"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"The following content is extracted from a PowerPoint file:\n\n{text}\n\n"
+                    "Extract all programming code found.\n"
+                    "For each code block:\n"
+                    "1. Write the language name\n"
+                    "2. Write the complete code inside a code block\n"
+                    "3. Write a very short description\n\n"
+                    "If there is no code, say: No programming code found in this file."
+                )
+            }
+        ]
+    }
+    response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -85,7 +153,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name = doc.file_name.lower()
 
     is_pdf = file_name.endswith(".pdf") or doc.mime_type == "application/pdf"
-    is_pptx = file_name.endswith(".pptx") or doc.mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    is_pptx = file_name.endswith(".pptx") or "presentationml" in (doc.mime_type or "")
 
     if not is_pdf and not is_pptx:
         await message.reply_text("⚠️ بس بدعم PDF و PPTX!")
@@ -109,45 +177,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         file = await context.bot.get_file(doc.file_id)
-        file_bytes = await file.download_as_bytearray()
+        file_bytes = bytes(await file.download_as_bytearray())
 
         if is_pdf:
-            # PDF بيتبعت مباشرة لـ Gemini
             pdf_base64 = base64.b64encode(file_bytes).decode("utf-8")
-            response = model.generate_content([
-                {
-                    "inline_data": {
-                        "mime_type": "application/pdf",
-                        "data": pdf_base64
-                    }
-                },
-                (
-                    "استخرج كل الكود البرمجي الموجود في هذا الملف.\n"
-                    "لكل كود:\n"
-                    "1. اكتب اسم اللغة\n"
-                    "2. اكتب الكود كاملاً داخل code block\n"
-                    "3. اكتب وصف قصير جداً للكود\n\n"
-                    "إذا لم يكن هناك كود، قل: لا يوجد كود برمجي في هذا الملف."
-                )
-            ])
+            result_text = ask_openrouter_with_pdf(pdf_base64)
         else:
-            # PPTX بنستخرج النص منه الأول وبعدين نبعته لـ Gemini
-            pptx_text = extract_text_from_pptx(bytes(file_bytes))
+            pptx_text = extract_text_from_pptx(file_bytes)
             if not pptx_text.strip():
                 await message.reply_text("⚠️ الملف فاضي أو مش فيه نصوص!")
                 user_usage[user_id]["count"] -= 1
                 return
-            response = model.generate_content(
-                f"المحتوى التالي مستخرج من ملف PowerPoint:\n\n{pptx_text}\n\n"
-                "استخرج كل الكود البرمجي الموجود.\n"
-                "لكل كود:\n"
-                "1. اكتب اسم اللغة\n"
-                "2. اكتب الكود كاملاً داخل code block\n"
-                "3. اكتب وصف قصير جداً للكود\n\n"
-                "إذا لم يكن هناك كود، قل: لا يوجد كود برمجي في هذا الملف."
-            )
-
-        result_text = response.text
+            result_text = ask_openrouter_with_text(pptx_text)
 
         if len(result_text) <= 4000:
             await message.reply_text(result_text, parse_mode="Markdown")
