@@ -260,9 +260,16 @@ def split_text(text: str, max_length: int) -> list:
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📄 ابعتلي ملف PDF أو PPTX وأنا هستخرجلك الكود!")
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"حدث خطأ غير متوقع: {context.error}")
+    # اختياري: ابعت رسالة للمستخدم تقوله إن فيه ضغط
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text("عذراً، السيرفر عليه ضغط حالياً. جرب كمان شوية!")
+
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_error_handler(error_handler) # ضيف السطر ده هنا
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
