@@ -18,18 +18,17 @@ MAX_PER_USER_PER_DAY = 15
 MAX_PER_MINUTE_GLOBAL = 18
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# قايمة موديلات نصية — لو الأول مشغول بنجرب التاني تلقائياً
+# الموديلات النصية
 TEXT_MODELS = [
+    "google/gemini-2.0-flash-lite-preview-02-05:free",
+    "google/gemini-2.0-pro-exp-02-05:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "deepseek/deepseek-r1:free",
 ]
 
-# قايمة موديلات vision للصور
+# موديلات الرؤية (Vision) للـ PPTX
 VISION_MODELS = [
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "google/gemini-2.0-flash-lite-preview-02-05:free",
+    "google/gemini-2.0-pro-exp-02-05:free",
 ]
 
 logging.basicConfig(level=logging.INFO)
@@ -100,40 +99,33 @@ def extract_pptx_content(pptx_bytes: bytes):
             text_parts.append(f"=== Slide {slide_num} ===\n" + "\n".join(slide_texts))
     return "\n\n".join(text_parts), images_b64
 
-
 def call_openrouter_with_fallback(models: list, payload_fn) -> str:
-    """
-    بيجرب الموديلات واحد واحد — لو الأول بيجيب 429 أو error بيجرب التاني
-    payload_fn: function بتاخد اسم الموديل وبترجع الـ payload
-    """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://railway.app", # متطلب أحياناً في OpenRouter
     }
-    last_error = None
+    last_error = "No response from any model"
+    
     for model in models:
         payload = payload_fn(model)
-        for attempt in range(2):  # محاولتين لكل موديل
-            try:
-                logger.info(f"بجرب موديل: {model}")
-                response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
-                if response.status_code == 429:
-                    wait = 10 * (attempt + 1)
-                    logger.warning(f"429 على {model}، بستنى {wait}s...")
-                    time.sleep(wait)
-                    continue
-                if response.status_code in (404, 501, 400):
-                    logger.warning(f"موديل {model} مش متاح: {response.status_code}")
-                    break  # جرب الموديل الجاي
-                response.raise_for_status()
+        try:
+            logger.info(f"Trying model: {model}")
+            response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"]
-            except Exception as e:
-                last_error = e
-                logger.warning(f"خطأ مع {model}: {e}")
-                break
-    raise Exception(f"كل الموديلات المتاحة فشلت. آخر خطأ: {last_error}")
-
-
+            else:
+                last_error = f"Model {model} returned {response.status_code}: {response.text}"
+                logger.warning(last_error)
+                continue # جرب الموديل اللي بعده
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"Error with {model}: {e}")
+            continue
+            
+    raise Exception(f"جميع المحاولات فشلت. السبب الأخير: {last_error}")
+    
 CODE_PROMPT = (
     "Extract all programming code from the following content.\n"
     "For each code block:\n"
