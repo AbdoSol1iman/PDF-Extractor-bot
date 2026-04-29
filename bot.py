@@ -3,34 +3,38 @@ import logging
 import base64
 import time
 import io
+import asyncio  # مكتبة التعامل مع العمليات المتزامنة
 from collections import defaultdict
-from openai import OpenAI  # المكتبة الجديدة
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from pptx import Presentation
 from PIL import Image
 from pypdf import PdfReader
 
-# الإعدادات من البيئة
+# --- الإعدادات ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# إعدادات الحدود
 MAX_PER_USER_PER_DAY = 15
 MAX_PER_MINUTE_GLOBAL = 18
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# إدارة الاستهلاك
+# إدارة الاستهلاك والقفل العالمي
 user_usage = defaultdict(lambda: {"count": 0, "reset_time": time.time() + 86400})
 global_minute_usage = {"count": 0, "reset_time": time.time() + 60}
+# هذا القفل يضمن معالجة ملف واحد فقط في كل مرة على مستوى البوت بالكامل
+processing_lock = asyncio.Lock()
 
 # تهيئة عميل GitHub Models
 client = OpenAI(
     base_url="https://models.inference.ai.azure.com",
     api_key=GITHUB_TOKEN,
 )
+
+# --- وظائف المساعدة ---
 
 def check_global_rate() -> bool:
     now = time.time()
@@ -66,7 +70,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 def extract_pptx_content(pptx_bytes: bytes):
     prs = Presentation(io.BytesIO(pptx_bytes))
     text_parts = []
-    images_b64 = []
     for slide_num, slide in enumerate(prs.slides, start=1):
         slide_texts = []
         for shape in slide.shapes:
@@ -74,20 +77,9 @@ def extract_pptx_content(pptx_bytes: bytes):
                 for para in shape.text_frame.paragraphs:
                     line = "".join(run.text for run in para.runs).strip()
                     if line: slide_texts.append(line)
-            if shape.shape_type == 13: # Image
-                try:
-                    img = Image.open(io.BytesIO(shape.image.blob)).convert("RGB")
-                    if max(img.size) > 800:
-                        ratio = 800 / max(img.size)
-                        img = img.resize((int(img.size[0]*ratio), int(img.size[1]*ratio)), Image.LANCZOS)
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    images_b64.append((slide_num, base64.b64encode(buf.getvalue()).decode("utf-8")))
-                except Exception as e:
-                    logger.warning(f"فشل صورة شريحة {slide_num}: {e}")
         if slide_texts:
             text_parts.append(f"=== Slide {slide_num} ===\n" + "\n".join(slide_texts))
-    return "\n\n".join(text_parts), images_b64
+    return "\n\n".join(text_parts)
 
 CODE_PROMPT = (
     "Extract all programming code from the following content.\n"
@@ -99,7 +91,6 @@ CODE_PROMPT = (
 )
 
 def call_github_models(prompt_content):
-    """الاتصال بـ GitHub Copilot Models"""
     try:
         response = client.chat.completions.create(
             messages=[
@@ -112,12 +103,14 @@ def call_github_models(prompt_content):
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"GitHub API Error: {e}")
-        raise Exception(f"فشل الاتصال بـ GitHub Models: {str(e)}")
+        raise Exception(f"GitHub Models Error: {str(e)}")
+
+# --- معالجات التليجرام ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 أهلاً بك في بوت مستخرج الكود (نسخة Copilot)!\n\n"
-        "📄 ابعتلي PDF أو PPTX وهستخرجلك الكود بجودة عالية.\n"
+        "👋 أهلاً بك! (نسخة الطابور المنظم 🚦)\n\n"
+        "📄 ابعتلي ملفاتك وسأقوم بمعالجتها واحدًا تلو الآخر لضمان أفضل جودة.\n"
         f"⚠️ الحد اليومي: {MAX_PER_USER_PER_DAY} ملفات."
     )
 
@@ -131,59 +124,69 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_pptx = file_name.endswith(".pptx") or "presentationml" in (doc.mime_type or "")
 
     if not is_pdf and not is_pptx:
-        await message.reply_text("⚠️ نعتذر، ارسل ملفات PDF أو PPTX فقط.")
+        await message.reply_text("⚠️ يرجى إرسال PDF أو PPTX فقط.")
         return
 
     allowed, remaining = check_user_rate(user_id)
     if not allowed:
-        await message.reply_text("❌ وصلت للحد اليومي!")
+        await message.reply_text("❌ عذراً، لقد استنفدت حدك اليومي.")
         return
 
     if not check_global_rate():
-        await message.reply_text("⏳ ضغط مؤقت، جرب كمان دقيقة.")
+        await message.reply_text("⏳ البوت عليه ضغط حالياً، جرب كمان دقيقة.")
         return
 
-    await message.reply_text(f"⏳ جاري معالجة {file_name} عبر GPT-4o-mini...")
+    # إبلاغ المستخدم أن الملف دخل الطابور
+    status_msg = await message.reply_text(f"📥 استلمت '{file_name}'.. تم وضعه في الطابور 🚦")
 
-    try:
-        file = await context.bot.get_file(doc.file_id)
-        file_bytes = bytes(await file.download_as_bytearray())
+    # --- بداية الطابور ---
+    async with processing_lock:
+        try:
+            await status_msg.edit_text(f"⚙️ جاري معالجة '{file_name}' الآن... يرجى الانتظار.")
+            
+            file = await context.bot.get_file(doc.file_id)
+            file_bytes = bytes(await file.download_as_bytearray())
 
-        if is_pdf:
-            extracted_text = extract_text_from_pdf(file_bytes)
-            if not extracted_text.strip():
-                await message.reply_text("⚠️ لم يتم العثور على نص في الـ PDF.")
-                return
-            final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
-        else:
-            extracted_text, images = extract_pptx_content(file_bytes)
-            # GitHub Models تدعم الصور في الـ vision ولكن للتبسيط سنرسل النص 
-            # وإذا أردت دعم الصور (Vision) يتم تعديل الـ prompt_content ليكون List
-            final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
+            if is_pdf:
+                extracted_text = extract_text_from_pdf(file_bytes)
+                if not extracted_text.strip():
+                    await message.reply_text(f"⚠️ الملف '{file_name}' لا يحتوي على نص قابل للقراءة.")
+                    return
+                final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
+            else:
+                extracted_text = extract_pptx_content(file_bytes)
+                final_prompt = f"{CODE_PROMPT}\n\nContent:\n{extracted_text}"
 
-        result_text = call_github_models(final_prompt)
+            # طلب الـ AI من GitHub Models
+            result_text = call_github_models(final_prompt)
 
-        # تقسيم الرسالة إذا كانت طويلة (تليجرام حدوده 4096 حرف)
-        if len(result_text) <= 4000:
-            await message.reply_text(result_text, parse_mode="Markdown")
-        else:
-            for i in range(0, len(result_text), 4000):
-                await message.reply_text(result_text[i:i+4000])
+            # إرسال النتيجة مع مراعاة طول الرسالة
+            if len(result_text) <= 4000:
+                await message.reply_text(f"✅ كود ملف: {file_name}\n\n{result_text}", parse_mode="Markdown")
+            else:
+                chunks = [result_text[i:i+4000] for i in range(0, len(result_text), 4000)]
+                for i, chunk in enumerate(chunks):
+                    header = f"📦 كود ملف: {file_name} (جزء {i+1})\n\n"
+                    await message.reply_text(header + chunk)
+            
+            # تأخير بسيط (ثانية) لراحة السيرفر قبل الملف القادم في الطابور
+            await asyncio.sleep(1.5)
 
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await message.reply_text(f"❌ خطأ فني: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error processing {file_name}: {e}")
+            await message.reply_text(f"❌ حصل خطأ أثناء معالجة '{file_name}':\n{str(e)}")
+    # --- نهاية الطابور ---
 
 def main():
     if not TELEGRAM_TOKEN or not GITHUB_TOKEN:
-        print("❌ تأكد من ضبط TELEGRAM_TOKEN و GITHUB_TOKEN في الإعدادات!")
+        print("❌ خطأ: لم يتم العثور على المتغيرات TELEGRAM_TOKEN أو GITHUB_TOKEN")
         return
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    print("✅ البوت شغال الآن باستخدام GitHub Models...")
+    print("✅ البوت شغال بنظام الطابور المطور...")
     app.run_polling()
 
 if __name__ == "__main__":
