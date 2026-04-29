@@ -18,7 +18,7 @@ MAX_PER_USER_PER_DAY = 15
 MAX_PER_MINUTE_GLOBAL = 18  # الحد الفعلي 20، خلينا هامش أمان
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+MODEL = "openrouter/free"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
