@@ -8,19 +8,19 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from pptx import Presentation
-from pptx.util import Inches
 from PIL import Image
+from pypdf import PdfReader
 
 # ===== التوكنات من Environment Variables =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-# ===== حدود الاستخدام =====
+# ===== إعدادات =====
 MAX_PER_USER_PER_DAY = 15
 MAX_PER_MINUTE_GLOBAL = 18
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "openrouter/free"
+TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"   # للنصوص
+VISION_MODEL = "google/gemma-4-31b-it:free"             # للصور
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,11 +53,19 @@ def check_user_rate(user_id: int):
     return True, remaining - 1
 
 
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """بيستخرج النص من PDF بـ pypdf"""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text_parts = []
+    for i, page in enumerate(reader.pages, start=1):
+        text = page.extract_text()
+        if text and text.strip():
+            text_parts.append(f"=== Page {i} ===\n{text.strip()}")
+    return "\n\n".join(text_parts)
+
+
 def extract_pptx_content(pptx_bytes: bytes):
-    """
-    بيستخرج النصوص والصور من الـ PPTX
-    بيرجع: (نص كامل, قايمة صور base64)
-    """
+    """بيستخرج النصوص والصور من PPTX"""
     prs = Presentation(io.BytesIO(pptx_bytes))
     text_parts = []
     images_b64 = []
@@ -65,33 +73,24 @@ def extract_pptx_content(pptx_bytes: bytes):
     for slide_num, slide in enumerate(prs.slides, start=1):
         slide_texts = []
         for shape in slide.shapes:
-            # استخراج النصوص
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
                     line = "".join(run.text for run in para.runs).strip()
                     if line:
                         slide_texts.append(line)
-
-            # استخراج الصور
-            if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+            if shape.shape_type == 13:
                 try:
                     img_bytes = shape.image.blob
-                    # تحويل لـ PNG وتصغير لو كبيرة
-                    img = Image.open(io.BytesIO(img_bytes))
-                    img = img.convert("RGB")
-                    # تصغير الصورة لو أكبر من 1000px
-                    max_size = 1000
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    max_size = 800
                     if max(img.size) > max_size:
                         ratio = max_size / max(img.size)
-                        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-                        img = img.resize(new_size, Image.LANCZOS)
+                        img = img.resize((int(img.size[0]*ratio), int(img.size[1]*ratio)), Image.LANCZOS)
                     buf = io.BytesIO()
                     img.save(buf, format="PNG")
-                    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    images_b64.append((slide_num, img_b64))
+                    images_b64.append((slide_num, base64.b64encode(buf.getvalue()).decode("utf-8")))
                 except Exception as e:
-                    logger.warning(f"فشل استخراج صورة من slide {slide_num}: {e}")
-
+                    logger.warning(f"فشل استخراج صورة slide {slide_num}: {e}")
         if slide_texts:
             text_parts.append(f"=== Slide {slide_num} ===\n" + "\n".join(slide_texts))
 
@@ -104,7 +103,7 @@ def call_openrouter(payload: dict, retries: int = 3) -> str:
         "Content-Type": "application/json",
     }
     for attempt in range(retries):
-        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
         if response.status_code == 429:
             wait = 15 * (attempt + 1)
             logger.warning(f"429 rate limit، بستنى {wait} ثانية...")
@@ -115,75 +114,42 @@ def call_openrouter(payload: dict, retries: int = 3) -> str:
     raise Exception("الـ API مشغول دلوقتي، جرب تاني بعد شوية.")
 
 
-def ask_openrouter_with_pdf(pdf_base64: str) -> str:
+CODE_PROMPT = (
+    "Extract all programming code from the following content.\n"
+    "For each code block:\n"
+    "1. Write the language name\n"
+    "2. Write the complete code inside a code block\n"
+    "3. Write a very short description\n\n"
+    "If there is no code, say: No programming code found."
+)
+
+
+def ask_with_text(text: str) -> str:
     payload = {
-        "model": MODEL,
-        "plugins": [{"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}],
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "file",
-                        "file": {
-                            "filename": "document.pdf",
-                            "content_type": "application/pdf",
-                            "data": pdf_base64,
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Extract all programming code from this file.\n"
-                            "For each code block:\n"
-                            "1. Write the language name\n"
-                            "2. Write the complete code inside a code block\n"
-                            "3. Write a very short description\n\n"
-                            "If there is no code, say: No programming code found in this file."
-                        )
-                    }
-                ]
-            }
-        ]
+        "model": TEXT_MODEL,
+        "messages": [{"role": "user", "content": f"{CODE_PROMPT}\n\n{text}"}]
     }
     return call_openrouter(payload)
 
 
-def ask_openrouter_with_pptx(text: str, images_b64: list) -> str:
-    """بيبعت النص + الصور لـ OpenRouter"""
+def ask_with_text_and_images(text: str, images_b64: list) -> str:
+    """بيبعت النص + الصور لـ vision model"""
     content = []
-
-    # أضف النص الأول
-    prompt = (
-        "Extract all programming code from the following PowerPoint content.\n"
-        "The content includes both extracted text and images from the slides.\n"
-        "For each code block found (in text OR in images):\n"
-        "1. Write the language name\n"
-        "2. Write the complete code inside a code block\n"
-        "3. Write a very short description\n\n"
-        "If there is no code, say: No programming code found in this file."
-    )
-
+    full_prompt = CODE_PROMPT
     if text.strip():
-        prompt += f"\n\n=== Extracted Text ===\n{text}"
+        full_prompt += f"\n\n=== Extracted Text ===\n{text}"
+    content.append({"type": "text", "text": full_prompt})
 
-    content.append({"type": "text", "text": prompt})
-
-    # أضف الصور
-    for slide_num, img_b64 in images_b64:
-        content.append({
-            "type": "text",
-            "text": f"=== Image from Slide {slide_num} ==="
-        })
+    # نبعت أول 10 صور بس عشان ما يتقلش الـ request
+    for slide_num, img_b64 in images_b64[:10]:
+        content.append({"type": "text", "text": f"--- Image from Slide {slide_num} ---"})
         content.append({
             "type": "image_url",
-            "image_url": {
-                "url": f"data:image/png;base64,{img_b64}"
-            }
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
         })
 
     payload = {
-        "model": MODEL,
+        "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}]
     }
     return call_openrouter(payload)
@@ -233,18 +199,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = bytes(await file.download_as_bytearray())
 
         if is_pdf:
-            pdf_base64 = base64.b64encode(file_bytes).decode("utf-8")
-            result_text = ask_openrouter_with_pdf(pdf_base64)
+            text = extract_text_from_pdf(file_bytes)
+            if not text.strip():
+                await message.reply_text("⚠️ الـ PDF مش فيه نص قابل للاستخراج (ممكن يكون scan).")
+                user_usage[user_id]["count"] -= 1
+                return
+            result_text = ask_with_text(text)
         else:
             text, images_b64 = extract_pptx_content(file_bytes)
             if not text.strip() and not images_b64:
                 await message.reply_text("⚠️ الملف فاضي أو مش فيه محتوى!")
                 user_usage[user_id]["count"] -= 1
                 return
-            img_count = len(images_b64)
-            if img_count > 0:
-                await message.reply_text(f"🖼️ لقيت {img_count} صورة في الـ PPTX، بحللهم...")
-            result_text = ask_openrouter_with_pptx(text, images_b64)
+            if images_b64:
+                await message.reply_text(f"🖼️ لقيت {len(images_b64)} صورة، بحللهم... (بحلل أول 10 بس)")
+            result_text = ask_with_text_and_images(text, images_b64)
 
         if len(result_text) <= 4000:
             await message.reply_text(result_text, parse_mode="Markdown")
