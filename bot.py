@@ -68,12 +68,26 @@ def extract_text_from_pptx(pptx_bytes: bytes) -> str:
     return "\n\n".join(text_parts)
 
 
-def ask_openrouter_with_pdf(pdf_base64: str) -> str:
-    """بيبعت الـ PDF لـ OpenRouter باستخدام cloudflare-ai engine المجاني"""
+def call_openrouter(payload: dict, retries: int = 3) -> str:
+    """بيبعت request لـ OpenRouter مع retry تلقائي لو جاله 429"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+    for attempt in range(retries):
+        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        if response.status_code == 429:
+            wait = 10 * (attempt + 1)  # 10s, 20s, 30s
+            logger.warning(f"429 rate limit، بستنى {wait} ثانية...")
+            time.sleep(wait)
+            continue
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    raise Exception("الـ API مشغول دلوقتي، جرب تاني بعد شوية.")
+
+
+def ask_openrouter_with_pdf(pdf_base64: str) -> str:
+    """بيبعت الـ PDF لـ OpenRouter باستخدام cloudflare-ai engine المجاني"""
     payload = {
         "model": MODEL,
         "plugins": [{"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}],
@@ -104,17 +118,11 @@ def ask_openrouter_with_pdf(pdf_base64: str) -> str:
             }
         ]
     }
-    response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    return call_openrouter(payload)
 
 
 def ask_openrouter_with_text(text: str) -> str:
     """بيبعت النص لـ OpenRouter (للـ PPTX)"""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "model": MODEL,
         "messages": [
@@ -132,9 +140,7 @@ def ask_openrouter_with_text(text: str) -> str:
             }
         ]
     }
-    response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    return call_openrouter(payload)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
